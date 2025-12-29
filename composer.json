@@ -1,6 +1,6 @@
 {
     "require": {
-        "endroid/qr-code": "^5.0",
+        "endroid/qr-code": "^6.0",
         "ext-gd": "*",
         "ext-xml": "*"
     }
