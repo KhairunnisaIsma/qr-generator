@@ -1,25 +1,48 @@
 <?php
 // api/index.php
 
-// 1. Path Autoload yang Aman untuk Vercel
+// --------------------------------------------------------------------------
+// 1. DEBUGGING MODE (PENTING SAAT DEPLOY)
+// --------------------------------------------------------------------------
+// Baris ini akan memunculkan pesan error detail jika script crash.
+// Setelah sukses production, baris ini bisa dikomentari/dihapus.
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+
+// --------------------------------------------------------------------------
+// 2. CORS HEADERS (Agar bisa diakses Frontend)
+// --------------------------------------------------------------------------
+// Handle Preflight Request (Browser cek izin dulu sebelum POST)
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    header('Access-Control-Allow-Origin: *');
+    header('Access-Control-Allow-Methods: POST, OPTIONS');
+    header('Access-Control-Allow-Headers: Content-Type');
+    http_response_code(200);
+    exit();
+}
+
+header('Access-Control-Allow-Origin: *');
+header('Content-Type: application/json');
+
+// --------------------------------------------------------------------------
+// 3. LOAD LIBRARY (Path Aman untuk Vercel)
+// --------------------------------------------------------------------------
+// Menggunakan __DIR__ memastikan PHP mencari folder vendor relatif terhadap file ini
 require __DIR__ . '/../vendor/autoload.php';
 
 use Endroid\QrCode\QrCode;
 use Endroid\QrCode\Logo\Logo;
 use Endroid\QrCode\Color\Color;
 use Endroid\QrCode\Writer\PngWriter;
-use Endroid\QrCode\Writer\SvgWriter; // Wajib untuk format SVG
+use Endroid\QrCode\Writer\SvgWriter; // Wajib ada untuk SVG
 use Endroid\QrCode\Encoding\Encoding;
 use Endroid\QrCode\ErrorCorrectionLevel;
 use Endroid\QrCode\RoundBlockSizeMode;
 
-// 2. Setup Headers (CORS & JSON)
-header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: POST');
-header('Access-Control-Allow-Headers: Content-Type');
-
-// 3. Helper Function: Hex to RGB
+// --------------------------------------------------------------------------
+// 4. HELPER FUNCTION
+// --------------------------------------------------------------------------
 function hexToColor($hex) {
     $hex = ltrim($hex, '#');
     if (strlen($hex) == 3) {
@@ -31,42 +54,50 @@ function hexToColor($hex) {
     return new Color($r, $g, $b);
 }
 
+// --------------------------------------------------------------------------
+// 5. MAIN LOGIC
+// --------------------------------------------------------------------------
 try {
-    // 4. Cek Extension GD (Penting untuk Vercel)
+    // Cek Extension GD (Wajib untuk manipulasi gambar)
     if (!extension_loaded('gd')) {
-        throw new Exception('GD extension is NOT loaded. Please create api/php.ini with extension=gd');
+        throw new Exception('Server Error: GD Extension is not enabled. Please check api/php.ini configuration.');
     }
 
-    // 5. Ambil Input JSON
-    $input = json_decode(file_get_contents('php://input'), true);
-    if (!$input) throw new Exception('Invalid JSON input');
+    // Cek Extension XML (Wajib untuk SVG)
+    if (!extension_loaded('xml')) {
+        throw new Exception('Server Error: XML Extension is not enabled. Please check api/php.ini configuration.');
+    }
 
-    // 6. Parsing Parameter
+    // Ambil Data Input
+    $inputJSON = file_get_contents('php://input');
+    $input = json_decode($inputJSON, true);
+
+    if (!$input) {
+        // Jika JSON invalid atau kosong
+        throw new Exception('Invalid JSON input received.');
+    }
+
+    // Default Values
     $text = $input['text'] ?? 'https://example.com';
     $size = (int)($input['size'] ?? 300);
     $margin = (int)($input['margin'] ?? 10);
     $fgHex = $input['fgColor'] ?? '#000000';
     $bgHex = $input['bgColor'] ?? '#ffffff';
     $logoUrl = $input['logoUrl'] ?? '';
-    
-    // Format default ke png jika kosong
     $format = strtolower($input['format'] ?? 'png');
-    
-    // Cek Transparansi
     $isTransparent = filter_var($input['transparent'] ?? false, FILTER_VALIDATE_BOOLEAN);
 
-    // 7. Konfigurasi Warna
+    // Setup Warna
     $fgColor = hexToColor($fgHex);
     
-    // Logic Transparan: SVG & PNG support, JPG tidak support.
+    // Logic: JPG tidak support transparan, paksa putih jika JPG
     if ($isTransparent && $format !== 'jpg' && $format !== 'jpeg') { 
-        // Alpha 127 = Full Transparent
-        $bgColor = new Color(255, 255, 255, 127);
+        $bgColor = new Color(255, 255, 255, 127); // 127 = Alpha Max (Transparent)
     } else {
         $bgColor = hexToColor($bgHex);
     }
 
-    // 8. Buat Object QR Code
+    // Buat QR Code Object
     $qrCode = new QrCode(
         data: $text,
         encoding: new Encoding('UTF-8'),
@@ -78,70 +109,74 @@ try {
         backgroundColor: $bgColor
     );
 
-    // 9. Buat Object Logo (Jika ada)
+    // Buat Logo Object
     $logo = null;
     if (!empty($logoUrl) && filter_var($logoUrl, FILTER_VALIDATE_URL)) {
         
-        // FIX PENTING: SvgWriter tidak support punchoutBackground
+        // FIX: SvgWriter error jika punchoutBackground=true
         $shouldPunchout = true;
         if ($format === 'svg') {
             $shouldPunchout = false; 
         }
 
-        $logo = new Logo(
-            path: $logoUrl,
-            resizeToWidth: (int)($size / 4), // Ukuran logo 1/4 dari QR
-            punchoutBackground: $shouldPunchout
-        );
+        try {
+            $logo = new Logo(
+                path: $logoUrl,
+                resizeToWidth: (int)($size / 4),
+                punchoutBackground: $shouldPunchout
+            );
+        } catch (Exception $e) {
+            // Jika logo gagal diload (misal link mati), abaikan logo dan lanjut generate QR
+            $logo = null; 
+        }
     }
 
-    // 10. Generate Output Berdasarkan Format
+    // Generate Output
     $base64 = '';
 
     if ($format === 'svg') {
-        // --- FORMAT SVG ---
+        // --- Output SVG ---
         $writer = new SvgWriter();
         $result = $writer->write($qrCode, $logo);
         $base64 = $result->getDataUri();
         
     } elseif ($format === 'jpg' || $format === 'jpeg') {
-        // --- FORMAT JPG (Manual Convert via GD) ---
-        // Karena library Endroid v5+ menghapus JpgWriter, kita convert dari PNG
+        // --- Output JPG (Manual Convert) ---
         $writer = new PngWriter();
         $result = $writer->write($qrCode, $logo);
         $pngString = $result->getString();
         
-        // Baca string PNG sebagai gambar
         $image = imagecreatefromstring($pngString);
-        if (!$image) throw new Exception('Failed to process image for JPG conversion');
+        if (!$image) throw new Exception('Failed to convert QR to Image Resource.');
 
-        // Render ke JPG
         ob_start();
-        imagejpeg($image, null, 90); // Kualitas 90
+        imagejpeg($image, null, 90); // Quality 90
         $jpgData = ob_get_clean();
         imagedestroy($image);
         
         $base64 = 'data:image/jpeg;base64,' . base64_encode($jpgData);
 
     } else {
-        // --- FORMAT PNG (Default) ---
+        // --- Output PNG (Default) ---
         $writer = new PngWriter();
         $result = $writer->write($qrCode, $logo);
         $base64 = $result->getDataUri();
     }
 
-    // 11. Kirim Response JSON
+    // Kirim Response Sukses
     echo json_encode([
         'status' => 'success',
         'image'  => $base64,
         'format' => $format
     ]);
 
-} catch (Exception $e) {
-    // Error Handling
+} catch (Throwable $e) {
+    // Catch All Error (termasuk Fatal Error PHP 7/8)
     http_response_code(500);
     echo json_encode([
-        'status' => 'error', 
-        'message' => $e->getMessage()
+        'status' => 'error',
+        'message' => $e->getMessage(),
+        'file' => $e->getFile(), // Info file error (untuk debug)
+        'line' => $e->getLine()  // Info baris error (untuk debug)
     ]);
 }
